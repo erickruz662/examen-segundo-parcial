@@ -1,0 +1,231 @@
+library(shiny)
+library(lpSolve)
+library(ggplot2)
+
+# Definir la interfaz de usuario
+ui <- fluidPage(
+  titlePanel("Corte de Tubos"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      numericInput("long_tubo", "Longitud del tubo estándar (cm):", value = 101, min = 1),
+      
+      h4("Seleccione tres tamaños de tubos más cortos y su cantidad requerida"),
+      fluidRow(
+        column(4, numericInput("tubo1", "Longitud Tubo 1:", value = 15, min = 1)),
+        column(4, numericInput("tubo2", "Longitud Tubo 2:", value = 22, min = 1)),
+        column(4, numericInput("tubo3", "Longitud Tubo 3:", value = 35, min = 1))
+      ),
+      fluidRow(
+        column(4, numericInput("cant1", "Cantidad requerida Tubo 1:", value = 300, min = 0)),
+        column(4, numericInput("cant2", "Cantidad requerida Tubo 2:", value = 200, min = 0)),
+        column(4, numericInput("cant3", "Cantidad requerida Tubo 3:", value = 150, min = 0))
+      ),
+      
+      h4("Ingrese los valores para cada patrón de corte"),
+      fluidRow(
+        column(3, h5("Patrón")),
+        column(3, h5("Tubo 1")),
+        column(3, h5("Tubo 2")),
+        column(3, h5("Tubo 3"))
+      ),
+      fluidRow(
+        column(3, h5("Patrón 1")),
+        column(3, numericInput("p1_t1", "", value = 0, min = 0)),
+        column(3, numericInput("p1_t2", "", value = 0, min = 0)),
+        column(3, numericInput("p1_t3", "", value = 0, min = 0)),
+        column(3, numericInput("p1_time", "Tiempo (min)", value = 0, min = 0)) # Tiempo para patrón 1
+      ),
+      fluidRow(
+        column(3, h5("Patrón 2")),
+        column(3, numericInput("p2_t1", "", value = 0, min = 0)),
+        column(3, numericInput("p2_t2", "", value = 0, min = 0)),
+        column(3, numericInput("p2_t3", "", value = 0, min = 0)),
+        column(3, numericInput("p2_time", "Tiempo (min)", value = 0, min = 0)) # Tiempo para patrón 2
+      ),
+      fluidRow(
+        column(3, h5("Patrón 3")),
+        column(3, numericInput("p3_t1", "", value = 0, min = 0)),
+        column(3, numericInput("p3_t2", "", value = 0, min = 0)),
+        column(3, numericInput("p3_t3", "", value = 0, min = 0)),
+        column(3, numericInput("p3_time", "Tiempo (min)", value = 0, min = 0)) # Tiempo para patrón 3
+      ),
+      
+      actionButton("validar", "Validar Patrones", class = "btn-primary"),
+      br(), br(),
+      textOutput("mensaje"),
+      br(),
+      actionButton("optimizar", "Optimizar", class = "btn-success"),
+      br(), br(),
+      actionButton("optimizar_desp", "Optimizar Desperdicio", class = "btn-warning"),
+      br(), br(),
+      actionButton("graficar_pareto", "Graficar Frontera de Pareto", class = "btn-info"),
+      br(), br(),
+      
+      h4("Generar puntos de la frontera de Pareto con desperdicio objetivo:"),
+      numericInput("desp_objetivo", "Desperdicio objetivo (cm):", value = 0, min = 0),
+      actionButton("generar_pareto", "Generar Punto Pareto", class = "btn-secondary"),
+      br(), br(),
+      
+      textOutput("total_tubos"),
+      br(),
+      
+      # Nuevo campo para ingresar el tiempo disponible para los cortes
+      numericInput("tiempo_disponible", "Tiempo Total Disponible (min):", value = 1370, min = 0),
+      
+      # Nuevo botón para calcular el número máximo de tubos con el tiempo disponible
+      actionButton("maximo_tubos", "Calcular Máximo de Tubos (Tiempo Disponible)", class = "btn-success"),
+      br(), br(),
+      actionButton("optimizar_tiempo", "Optimizar Tiempo de Corte", class = "btn-warning"),
+      br(), br(),
+      # Nuevo botón para graficar la frontera de Pareto con cantidad de tubos y tiempo
+      actionButton("graficar_pareto_tiempo", "Graficar Pareto: Tubos vs Tiempo", class = "btn-info")
+    ),
+    
+    mainPanel(
+      tableOutput("resultados"),
+      tableOutput("optimizacion"),
+      plotOutput("frontera_pareto"),
+      plotOutput("pareto_tiempo")  # Nueva salida para el gráfico de Pareto relacionado con el tiempo
+    )
+  )
+)
+
+# Definir el servidor
+server <- function(input, output) {
+  resultados <- reactiveVal(NULL)
+  optimizacion <- reactiveVal(NULL)
+  total_tubos <- reactiveVal(NULL)
+  pareto_data <- reactiveVal(data.frame(Tubos = numeric(), Desperdicio = numeric()))
+  pareto_tiempo_data <- reactiveVal(data.frame(Tubos = numeric(), Tiempo = numeric()))  # Datos para Pareto tiempo
+  
+  observeEvent(input$validar, {
+    patrones <- data.frame(
+      Patrón = c("Patrón 1", "Patrón 2", "Patrón 3"),
+      Longitud_Total = c(
+        input$p1_t1 * input$tubo1 + input$p1_t2 * input$tubo2 + input$p1_t3 * input$tubo3,
+        input$p2_t1 * input$tubo1 + input$p2_t2 * input$tubo2 + input$p2_t3 * input$tubo3,
+        input$p3_t1 * input$tubo1 + input$p3_t2 * input$tubo2 + input$p3_t3 * input$tubo3
+      ),
+      Longitud_Tubo_Estandar = input$long_tubo
+    )
+    patrones$Cumple <- ifelse(patrones$Longitud_Total <= patrones$Longitud_Tubo_Estandar, "✔ Cumple", "✘ No Cumple")
+    patrones$Desperdicio <- patrones$Longitud_Tubo_Estandar - patrones$Longitud_Total
+    resultados(patrones)
+  })
+  
+  optimizacion_lp <- function(f.obj, b.desperdicio = NULL, tiempo_disponible = NULL) {
+    A <- matrix(c(input$p1_t1, input$p2_t1, input$p3_t1,
+                  input$p1_t2, input$p2_t2, input$p3_t2,
+                  input$p1_t3, input$p2_t3, input$p3_t3),
+                nrow = 3, byrow = TRUE)
+    b <- c(input$cant1, input$cant2, input$cant3)
+    f.dir <- c(">=", ">=", ">=")
+    
+    if (!is.null(b.desperdicio)) {
+      desperdicio_por_patron <- c(
+        input$long_tubo - (input$p1_t1 * input$tubo1 + input$p1_t2 * input$tubo2 + input$p1_t3 * input$tubo3),
+        input$long_tubo - (input$p2_t1 * input$tubo1 + input$p2_t2 * input$tubo2 + input$p2_t3 * input$tubo3),
+        input$long_tubo - (input$p3_t1 * input$tubo1 + input$p3_t2 * input$tubo2 + input$p3_t3 * input$tubo3)
+      )
+      A <- rbind(A, desperdicio_por_patron)
+      b <- c(b, b.desperdicio)
+      f.dir <- c(f.dir, "<=")
+    }
+    
+    # Agregar la restricción de tiempo disponible si se especifica
+    if (!is.null(tiempo_disponible)) {
+      tiempos_por_patron <- c(input$p1_time, input$p2_time, input$p3_time)
+      A <- rbind(A, tiempos_por_patron)
+      b <- c(b, tiempo_disponible)
+      f.dir <- c(f.dir, "<=")
+    }
+    
+    sol <- lp("min", f.obj, A, f.dir, b, all.int = TRUE)
+    sol
+  }
+  
+  observeEvent(input$optimizar, {
+    sol <- optimizacion_lp(rep(1, 3))
+    if (sol$status == 0) {
+      opt_result <- data.frame(Patrón = c("Patrón 1", "Patrón 2", "Patrón 3"), Cantidad = sol$solution)
+      optimizacion(opt_result)
+      total_tubos_usados <- sum(sol$solution)
+      desperdicio_por_patron <- c(
+        input$long_tubo - (input$p1_t1 * input$tubo1 + input$p1_t2 * input$tubo2 + input$p1_t3 * input$tubo3),
+        input$long_tubo - (input$p2_t1 * input$tubo1 + input$p2_t2 * input$tubo2 + input$p2_t3 * input$tubo3),
+        input$long_tubo - (input$p3_t1 * input$tubo1 + input$p3_t2 * input$tubo2 + input$p3_t3 * input$tubo3)
+      )
+      desperdicio_total <- sum(desperdicio_por_patron * sol$solution)
+      total_tubos(paste("Total de tubos estándar utilizados al optimizar: ", total_tubos_usados))
+      output$mensaje <- renderText({ paste("Desperdicio total del proceso: ", desperdicio_total, "cm") })
+      pareto_data(rbind(pareto_data(), data.frame(Tubos = total_tubos_usados, Desperdicio = desperdicio_total)))
+      pareto_tiempo_data(rbind(pareto_tiempo_data(), data.frame(Tubos = total_tubos_usados, Tiempo = sum(input$p1_time * sol$solution[1], input$p2_time * sol$solution[2], input$p3_time * sol$solution[3]))))
+    } else {
+      total_tubos("No hay solución factible")
+      output$mensaje <- renderText("No se pudo encontrar una solución factible.")
+    }
+  })
+  
+  observeEvent(input$maximo_tubos, { 
+    tiempos <- c(input$p1_time, input$p2_time, input$p3_time)
+    
+    # Cálculo de número máximo de ciclos de patrones dentro del tiempo disponible
+    max_tubos <- floor(input$tiempo_disponible / sum(tiempos))  # Número de ciclos completos
+    
+    # Cálculo del tiempo total para esos ciclos
+    tiempo_total <- max_tubos * sum(tiempos)
+    
+    # Almacenar en los datos de Pareto para que aparezca en la gráfica
+    pareto_tiempo_data(rbind(pareto_tiempo_data(), data.frame(Tubos = max_tubos, Tiempo = tiempo_total)))
+    
+    total_tubos(paste("Número máximo de tubos que se pueden cortar: ", max_tubos))
+  })
+  
+  observeEvent(input$optimizar_desp, {
+    desperdicio_por_patron <- c(
+      input$long_tubo - (input$p1_t1 * input$tubo1 + input$p1_t2 * input$tubo2 + input$p1_t3 * input$tubo3),
+      input$long_tubo - (input$p2_t1 * input$tubo1 + input$p2_t2 * input$tubo2 + input$p2_t3 * input$tubo3),
+      input$long_tubo - (input$p3_t1 * input$tubo1 + input$p3_t2 * input$tubo2 + input$p3_t3 * input$tubo3)
+    )
+    sol <- optimizacion_lp(desperdicio_por_patron)
+    if (sol$status == 0) {
+      desperdicio_total <- sum(desperdicio_por_patron * sol$solution)
+      opt_result <- data.frame(Patrón = c("Patrón 1", "Patrón 2", "Patrón 3"),
+                               Cantidad = sol$solution,
+                               Desperdicio_Total = desperdicio_total)
+      optimizacion(opt_result)
+      total_tubos(paste("Total de tubos estándar utilizados al minimizar desperdicio: ", sum(sol$solution)))
+      pareto_data(rbind(pareto_data(), data.frame(Tubos = sum(sol$solution), Desperdicio = desperdicio_total)))
+    } else {
+      total_tubos("No hay solución factible")
+    }
+  })
+  
+  observeEvent(input$graficar_pareto, {
+    output$frontera_pareto <- renderPlot({
+      ggplot(pareto_data(), aes(x = Tubos, y = Desperdicio)) +
+        geom_point(color = "blue", size = 3) +
+        geom_line(color = "red") +
+        labs(title = "Frontera de Pareto", x = "Cantidad de Tubos", y = "Desperdicio (cm)") +
+        theme_minimal()
+    })
+  })
+  
+  observeEvent(input$graficar_pareto_tiempo, {  # Nueva gráfica de Pareto (Tubos vs Tiempo)
+    output$pareto_tiempo <- renderPlot({
+      ggplot(pareto_tiempo_data(), aes(x = Tubos, y = Tiempo)) +
+        geom_point(color = "green", size = 3) +
+        geom_line(color = "orange") +
+        labs(title = "Frontera de Pareto: Tubos vs Tiempo", x = "Cantidad de Tubos", y = "Tiempo Total (min)") +
+        theme_minimal()
+    })
+  })
+  
+  output$resultados <- renderTable({ resultados() })
+  output$optimizacion <- renderTable({ optimizacion() })
+  output$total_tubos <- renderText({ total_tubos() })
+}
+
+# Ejecutar la aplicación
+shinyApp(ui = ui, server = server)
